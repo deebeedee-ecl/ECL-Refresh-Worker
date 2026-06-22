@@ -93,8 +93,9 @@ function normalizeRiotId(name, tag) {
 
 async function lookupProfileWithFallback(riotName, riotTag, areaId) {
   // Sanitize first – strip any invisible control chars from stored values
+  // Also strip any leading # from the tag (some DB entries store e.g. "#36614")
   const cleanName = sanitize(riotName);
-  const cleanTag  = sanitize(riotTag);
+  const cleanTag  = sanitize(riotTag)?.replace(/^#+/, "");
 
   // Mirror the website's lookupLzyumiIdentity: try plain name first, then name#tag.
   // lzyumi often resolves on the plain name but not the full Riot ID.
@@ -136,7 +137,8 @@ async function lookupProfileWithFallback(riotName, riotTag, areaId) {
 
 async function refreshProfile(pool, profile) {
   const { id, displayName, riotName, riotTag, openId: storedOpenId, chinaServerId } = profile;
-  const lookupName = riotTag ? `${riotName}#${riotTag}` : riotName;
+  const cleanRiotTag = riotTag?.replace(/^#+/, "");
+  const lookupName = cleanRiotTag ? `${riotName}#${cleanRiotTag}` : riotName;
 
   // Mirror website's lookupLzyumiIdentity: try plain name first, then name#tag
   const [lookupResult, rankedResult] = await Promise.allSettled([
