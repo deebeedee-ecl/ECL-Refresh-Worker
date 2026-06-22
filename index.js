@@ -137,11 +137,26 @@ async function fetchRecentStat(openId, areaId) {
   return lzyumiGet(`${LZYUMI_BASE_URL}/getPlayerRecentStat?${p}`);
 }
 
+// Strip Unicode bidirectional control characters that can be embedded in user-supplied
+// Riot names/tags. Keeps intentional chars like U+FFA0 (Halfwidth Hangul Filler).
+function sanitize(str) {
+  if (!str) return str;
+  return str.replace(/[\u2066\u2067\u2068\u2069\u202A-\u202E\u200B\u200C\u200D\uFEFF]/g, "").trim();
+}
+
+function normalizeRiotId(name, tag) {
+  return `${sanitize(name)}#${sanitize(tag)}`.toLowerCase();
+}
+
 async function lookupProfileWithFallback(riotName, riotTag, areaId) {
+  // Sanitize first – strip any invisible control chars from stored values
+  const cleanName = sanitize(riotName);
+  const cleanTag  = sanitize(riotTag);
+
   // Mirror the website's lookupLzyumiIdentity: try plain name first, then name#tag.
   // lzyumi often resolves on the plain name but not the full Riot ID.
   const candidates = Array.from(
-    new Set([riotName.trim(), riotTag ? `${riotName.trim()}#${riotTag.trim()}` : null].filter(Boolean))
+    new Set([cleanName, cleanTag ? `${cleanName}#${cleanTag}` : null].filter(Boolean))
   );
 
   let fallback = null;
@@ -156,9 +171,9 @@ async function lookupProfileWithFallback(riotName, riotTag, areaId) {
     }
 
     // If we have a tag, verify it matches
-    if (riotTag) {
+    if (cleanTag) {
       const resolved = resolvedName.trim().toLowerCase();
-      const expected = normalizeRiotId(riotName, riotTag);
+      const expected = normalizeRiotId(cleanName, cleanTag);
       if (resolved !== expected) {
         fallback = fallback ?? { found: false, raw, mismatch: `expected "${expected}", got "${resolved}"` };
         continue;
