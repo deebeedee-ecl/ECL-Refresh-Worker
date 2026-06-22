@@ -445,13 +445,8 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-if (!ECL_JOB_SECRET) {
-  console.error("[refresh] ✗ ECL_JOB_SECRET is not set. Add it to Railway env vars (must match Vercel).");
-  process.exit(1);
-}
-
 console.log("[refresh] ECL Refresh Worker starting...");
-console.log(`[refresh]   Proxy          : ${ECL_SITE_URL}/api/lzyumi-proxy`);
+console.log(`[refresh]   lzyumi         : direct (${LZYUMI_BASE})`);
 console.log(`[refresh]   Poll interval  : every ${POLL_INTERVAL_MS / 60000} minutes`);
 console.log(`[refresh]   Batch size     : ${BATCH_SIZE} profiles`);
 console.log(`[refresh]   Stale window   : ${REFRESH_STALE_MS / 3600000} hours`);
