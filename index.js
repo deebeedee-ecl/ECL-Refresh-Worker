@@ -265,12 +265,18 @@ async function runBatch(pool) {
   const { rows: profiles } = await pool.query(
     `SELECT id, "displayName", "riotName", "riotTag", "openId", "chinaServerId"
        FROM "AccountProfile"
-      WHERE "accountStatus"    = 'ACTIVE'
+      WHERE "accountStatus"      = 'ACTIVE'
         AND "verificationStatus" = 'VERIFIED'
-        AND "riotName"          != ''
-        AND "chinaServerId"      IS NOT NULL
-        AND ("lzyumiLastLookupAt" IS NULL OR "lzyumiLastLookupAt" < $1)
-      ORDER BY "lzyumiLastLookupAt" ASC NULLS FIRST
+        AND "riotName"           != ''
+        AND "chinaServerId"       IS NOT NULL
+        AND (
+          "lzyumiLastLookupAt" IS NULL
+          OR "lzyumiLastLookupAt" < $1
+          OR "lzyumiRawProfile"  IS NULL
+        )
+      ORDER BY
+        CASE WHEN "lzyumiRawProfile" IS NULL THEN 0 ELSE 1 END ASC,
+        "lzyumiLastLookupAt" ASC NULLS FIRST
       LIMIT $2`,
     [staleBefore, BATCH_SIZE],
   );
