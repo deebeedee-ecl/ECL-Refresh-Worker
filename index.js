@@ -5,16 +5,14 @@ require("dotenv").config();
  * ECL Profile Stats Refresh Worker
  * ──────────────────────────────────────────────────────────────────────────
  * Standalone Railway service. Connects directly to the same Postgres DB as
- * the ECL website and re-fetches lzyumi / ecl.gg stats for every verified
- * player whose data is older than REFRESH_STALE_HOURS hours.
+ * the ECL website and re-fetches lzyumi stats for every verified player
+ * whose data is older than REFRESH_STALE_HOURS hours.
  *
- * Runs a batch every POLL_INTERVAL_MINUTES minutes so it never hammers
- * lzyumi and never hits Vercel's serverless timeout limit.
+ * Calls lzyumi DIRECTLY – deploy this service to an Asian Railway region
+ * (Singapore / Tokyo) so the IP is not blocked by lzyumi.
  *
  * Required env vars (set in Railway):
  *   DATABASE_URL       – same Postgres connection string as the website
- *   ECL_SITE_URL       – website base URL (e.g. https://eclchina.lol)
- *   ECL_JOB_SECRET     – must match ECL_JOB_SECRET on Vercel
  *
  * Optional env vars:
  *   POLL_INTERVAL_MINUTES    – how often to check for stale profiles (default 20)
@@ -24,60 +22,108 @@ require("dotenv").config();
  *   DB_SSL                   – set to "false" to disable Postgres SSL
  */
 
-const http = require("node:http");
-const axios = require("axios");
+const crypto = require("node:crypto");
+const http   = require("node:http");
+const axios  = require("axios");
 const { Pool } = require("pg");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DATABASE_URL   = process.env.DATABASE_URL;
-const ECL_SITE_URL   = (process.env.ECL_SITE_URL || "https://eclchina.lol").replace(/\/$/, "");
-const ECL_JOB_SECRET = process.env.ECL_JOB_SECRET;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 const POLL_INTERVAL_MS =
   parseFloat(process.env.POLL_INTERVAL_MINUTES || "20") * 60 * 1000;
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "5", 10);
 const REFRESH_STALE_MS =
   parseFloat(process.env.REFRESH_STALE_HOURS || "12") * 60 * 60 * 1000;
-const LZYUMI_TIMEOUT_MS = 20000;     // 20 s per proxy call (Vercel → lzyumi)
-const DELAY_BETWEEN_MS = 2000;       // rate-limit pause between profiles
+const LZYUMI_TIMEOUT_MS = 20000;
+const DELAY_BETWEEN_MS = 2000;
 const HTTP_PORT = parseInt(process.env.PORT || "3000", 10);
 
+const LZYUMI_BASE = "https://a.2025lol.top/lzyumi/lol/info";
+
+const CHINA_SERVERS = [
+  { id: 1,  name: "艾欧尼亚" },
+  { id: 14, name: "黑色玫瑰" },
+  { id: 31, name: "峡谷之巅" },
+  { id: 30, name: "男爵领域" },
+  { id: 3,  name: "祖安" },
+  { id: 4,  name: "诺克萨斯" },
+  { id: 16, name: "慕里玛" },
+];
+
+function getChinaServer(areaId) {
+  return CHINA_SERVERS.find((s) => s.id === areaId) ?? CHINA_SERVERS[0];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Proxy helpers – all lzyumi calls go through the Vercel website's
-// /api/lzyumi-proxy endpoint so they originate from a Vercel IP.
+// lzyumi direct API helpers (mirrors lib/lzyumi.ts on the website)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function proxyGet(action, params) {
-  const url = new URL(`${ECL_SITE_URL}/api/lzyumi-proxy`);
-  url.searchParams.set("action", action);
-  for (const [k, v] of Object.entries(params)) {
-    if (v != null && v !== "") url.searchParams.set(k, String(v));
-  }
-  const res = await axios.get(url.toString(), {
+function createLzyumiSignature() {
+  const now = new Date();
+  const m  = String(now.getMonth() + 1);
+  const d  = String(now.getDate());
+  const h  = String(now.getHours());
+  const mi = String(now.getMinutes());
+  const s  = String(now.getSeconds());
+  const src =
+    "dld" + m.padStart(2,"0") + "o" + d.padStart(2,"0") +
+    "u"   + h.padStart(2,"0") + "d" + mi.padStart(2,"0") +
+    "o"   + s.padStart(2,"0") + "dld";
+  const lzyumiSign = crypto.createHash("md5").update(src).digest("hex");
+  const signStr = `${m}${d}${h}${mi}${s}${m.length*3}${d.length*3}${h.length*3}${mi.length*3}${s.length*3}`;
+  return { lzyumiSign, signStr };
+}
+
+async function lzyumiFetch(url) {
+  const res = await axios.get(url, {
     timeout: LZYUMI_TIMEOUT_MS,
-    headers: { "x-ecl-job-secret": ECL_JOB_SECRET },
+    headers: {
+      Accept: "application/json, text/plain, */*",
+      Referer: "https://a.2025lol.top/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    },
   });
-  if (res.data?.error) throw new Error(`Proxy error: ${res.data.error}`);
   return res.data;
 }
 
 async function lookupProfile(riotName, areaId) {
-  return proxyGet("lookup", { nickname: riotName, areaId });
+  const server = getChinaServer(areaId);
+  const { lzyumiSign, signStr } = createLzyumiSignature();
+  // lzyumi requires # to be encoded as *~*~* (not %23)
+  const encodedNick = encodeURIComponent(riotName.replace(/#/g, "*~*~*"));
+  const url =
+    `${LZYUMI_BASE}?nickname=${encodedNick}&allCount=10` +
+    `&areaId=${server.id}&areaName=${encodeURIComponent(server.name)}` +
+    `&seleMe=1&filter=1&openId=&lzyumiSign=${lzyumiSign}&signStr=${signStr}`;
+  return lzyumiFetch(url);
 }
 
 async function fetchRankedGames(riotName, areaId) {
-  const result = await proxyGet("ranked", { nickname: riotName, areaId });
-  return {
-    soloGames: Array.isArray(result?.soloGames) ? result.soloGames : [],
-    flexGames: Array.isArray(result?.flexGames) ? result.flexGames : [],
-  };
+  const server = getChinaServer(areaId);
+  async function fetchFilter(filter) {
+    const { lzyumiSign, signStr } = createLzyumiSignature();
+    const encodedNick = encodeURIComponent(riotName.replace(/#/g, "*~*~*"));
+    const url =
+      `${LZYUMI_BASE}?nickname=${encodedNick}&allCount=20` +
+      `&areaId=${server.id}&areaName=${encodeURIComponent(server.name)}` +
+      `&seleMe=1&filter=${filter}&openId=&lzyumiSign=${lzyumiSign}&signStr=${signStr}`;
+    const res = await lzyumiFetch(url);
+    return Array.isArray(res.data) ? res.data : [];
+  }
+  const [soloGames, flexGames] = await Promise.all([fetchFilter(2), fetchFilter(3)]);
+  return { soloGames, flexGames };
 }
 
 async function fetchRecentStat(openId, areaId) {
-  return proxyGet("recent", { openId, areaId });
+  const { lzyumiSign, signStr } = createLzyumiSignature();
+  const url =
+    `${LZYUMI_BASE}/getPlayerRecentStat?openId=${encodeURIComponent(openId)}` +
+    `&areaId=${areaId}&lzyumiSign=${lzyumiSign}&signStr=${signStr}`;
+  return lzyumiFetch(url);
 }
 
 // Strip Unicode bidirectional control characters that can be embedded in user-supplied
