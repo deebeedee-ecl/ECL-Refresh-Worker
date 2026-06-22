@@ -173,6 +173,11 @@ async function refreshProfile(pool, profile) {
     const freshOpenId = raw?.battleInfo?.openId;
     if (freshOpenId) openId = freshOpenId;
 
+    // Debug: log what lzyumi actually returned
+    if (!raw?.battleInfo) {
+      console.warn(`[refresh] ⚠ ${displayName}: lzyumi returned no battleInfo. code=${raw?.code} message=${raw?.message}`);
+    }
+
     if (riotTag && raw?.battleInfo?.nameInfoNew) {
       // Verify lzyumi returned the correct account
       const resolved = raw.battleInfo.nameInfoNew.trim().toLowerCase();
@@ -185,7 +190,20 @@ async function refreshProfile(pool, profile) {
     } else if (raw?.battleInfo?.openId) {
       // No tag to verify against – accept as-is
       validRawProfile = raw;
+    } else if (raw?.battleInfo && !raw.battleInfo?.nameInfoNew) {
+      console.warn(`[refresh] ⚠ ${displayName}: battleInfo exists but nameInfoNew is missing. openId=${raw.battleInfo?.openId}`);
     }
+  } else {
+    console.warn(`[refresh] ⚠ ${displayName}: raw lookup rejected – ${rawResult.reason?.message}`);
+  }
+
+  if (rankedResult.status === "fulfilled") {
+    const { soloGames, flexGames } = rankedResult.value;
+    if (soloGames.length === 0 && flexGames.length === 0) {
+      console.warn(`[refresh] ⚠ ${displayName}: ranked games returned empty arrays`);
+    }
+  } else {
+    console.warn(`[refresh] ⚠ ${displayName}: ranked games rejected – ${rankedResult.reason?.message}`);
   }
 
   // ── Fetch recent stat (needs openId) ──────────────────────────────────────
