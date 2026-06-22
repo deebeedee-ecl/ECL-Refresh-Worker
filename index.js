@@ -166,6 +166,7 @@ async function lookupProfileWithFallback(riotName, riotTag, areaId) {
     const openId = raw?.battleInfo?.openId;
 
     if (!raw?.battleInfo || !openId || !resolvedName) {
+      console.warn(`[refresh] ⚠ lookup "${candidate}" → no battleInfo. Full response:`, JSON.stringify(raw));
       fallback = fallback ?? { found: false, raw };
       continue;
     }
