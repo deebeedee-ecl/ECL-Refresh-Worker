@@ -13,9 +13,10 @@ require("dotenv").config();
  *
  * Required env vars (set in Railway):
  *   DATABASE_URL       – same Postgres connection string as the website
+ *   ECL_SITE_URL       – website base URL (e.g. https://eclchina.lol)
+ *   ECL_JOB_SECRET     – must match ECL_JOB_SECRET on Vercel
  *
  * Optional env vars:
- *   LZYUMI_BASE_URL          – ecl.gg API base (has a default)
  *   POLL_INTERVAL_MINUTES    – how often to check for stale profiles (default 20)
  *   BATCH_SIZE               – profiles per poll cycle (default 5)
  *   REFRESH_STALE_HOURS      – hours before a profile is considered stale (default 12)
@@ -23,7 +24,6 @@ require("dotenv").config();
  *   DB_SSL                   – set to "false" to disable Postgres SSL
  */
 
-const crypto = require("node:crypto");
 const http = require("node:http");
 const axios = require("axios");
 const { Pool } = require("pg");
@@ -32,109 +32,52 @@ const { Pool } = require("pg");
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DATABASE_URL = process.env.DATABASE_URL;
-const LZYUMI_BASE_URL =
-  process.env.LZYUMI_BASE_URL || "https://a.2025lol.top/lzyumi/lol/info";
+const DATABASE_URL   = process.env.DATABASE_URL;
+const ECL_SITE_URL   = (process.env.ECL_SITE_URL || "https://eclchina.lol").replace(/\/$/, "");
+const ECL_JOB_SECRET = process.env.ECL_JOB_SECRET;
 
 const POLL_INTERVAL_MS =
   parseFloat(process.env.POLL_INTERVAL_MINUTES || "20") * 60 * 1000;
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "5", 10);
 const REFRESH_STALE_MS =
   parseFloat(process.env.REFRESH_STALE_HOURS || "12") * 60 * 60 * 1000;
-const LZYUMI_TIMEOUT_MS = 15000;     // 15 s per lzyumi call – hard abort
-const DELAY_BETWEEN_MS = 3500;       // rate-limit pause between profiles
+const LZYUMI_TIMEOUT_MS = 20000;     // 20 s per proxy call (Vercel → lzyumi)
+const DELAY_BETWEEN_MS = 2000;       // rate-limit pause between profiles
 const HTTP_PORT = parseInt(process.env.PORT || "3000", 10);
 
-// China servers – must match ecl-split-one/lib/lzyumi.ts exactly
-const CHINA_SERVERS = [
-  { id: 1,  name: "\u827e\u6b27\u5c3c\u4e9a" },
-  { id: 14, name: "\u9ed1\u8272\u73ab\u7470" },
-  { id: 31, name: "\u5ce1\u8c37\u4e4b\u5dc5" },
-  { id: 30, name: "\u7537\u7235\u9886\u57df" },
-  { id: 3,  name: "\u7956\u5b89" },
-  { id: 4,  name: "\u8bfa\u514b\u8428\u65af" },
-  { id: 16, name: "\u6055\u745e\u739b" },
-];
-
 // ─────────────────────────────────────────────────────────────────────────────
-// lzyumi API helpers (ported from ecl-split-one/lib/lzyumi.ts)
+// Proxy helpers – all lzyumi calls go through the Vercel website's
+// /api/lzyumi-proxy endpoint so they originate from a Vercel IP.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function getChinaServer(areaId) {
-  return CHINA_SERVERS.find((s) => s.id === Number(areaId)) ?? CHINA_SERVERS[0];
-}
-
-function createSignature() {
-  const now = new Date();
-  const month   = String(now.getMonth() + 1);
-  const day     = String(now.getDate());
-  const hours   = String(now.getHours());
-  const minutes = String(now.getMinutes());
-  const seconds = String(now.getSeconds());
-
-  const signSource =
-    `dld${month.padStart(2,"0")}o${day.padStart(2,"0")}` +
-    `u${hours.padStart(2,"0")}d${minutes.padStart(2,"0")}` +
-    `o${seconds.padStart(2,"0")}dld`;
-
-  const lzyumiSign = crypto.createHash("md5").update(signSource).digest("hex");
-  const signStr =
-    `${month}${day}${hours}${minutes}${seconds}` +
-    `${month.length * 3}${day.length * 3}${hours.length * 3}` +
-    `${minutes.length * 3}${seconds.length * 3}`;
-
-  return { lzyumiSign, signStr };
-}
-
-async function lzyumiGet(url) {
-  const res = await axios.get(url, {
+async function proxyGet(action, params) {
+  const url = new URL(`${ECL_SITE_URL}/api/lzyumi-proxy`);
+  url.searchParams.set("action", action);
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null && v !== "") url.searchParams.set(k, String(v));
+  }
+  const res = await axios.get(url.toString(), {
     timeout: LZYUMI_TIMEOUT_MS,
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      Referer: "https://a.2025lol.top/",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    },
+    headers: { "x-ecl-job-secret": ECL_JOB_SECRET },
   });
+  if (res.data?.error) throw new Error(`Proxy error: ${res.data.error}`);
   return res.data;
 }
 
-function lookupUrl(riotName, areaId, filter = 1) {
-  const server = getChinaServer(areaId);
-  const { lzyumiSign, signStr } = createSignature();
-  const p = new URLSearchParams({
-    nickname: riotName.trim(),
-    allCount: filter === 1 ? "10" : "20",
-    areaId: String(server.id),
-    areaName: server.name,
-    seleMe: "1",
-    filter: String(filter),
-    openId: "",
-    lzyumiSign,
-    signStr,
-  });
-  return `${LZYUMI_BASE_URL}?${p}`;
-}
-
 async function lookupProfile(riotName, areaId) {
-  return lzyumiGet(lookupUrl(riotName, areaId, 1));
+  return proxyGet("lookup", { nickname: riotName, areaId });
 }
 
 async function fetchRankedGames(riotName, areaId) {
-  const [solo, flex] = await Promise.allSettled([
-    lzyumiGet(lookupUrl(riotName, areaId, 2)), // Solo/Duo
-    lzyumiGet(lookupUrl(riotName, areaId, 3)), // Flex
-  ]);
+  const result = await proxyGet("ranked", { nickname: riotName, areaId });
   return {
-    soloGames: solo.status === "fulfilled" && Array.isArray(solo.value?.data) ? solo.value.data : [],
-    flexGames: flex.status === "fulfilled" && Array.isArray(flex.value?.data) ? flex.value.data : [],
+    soloGames: Array.isArray(result?.soloGames) ? result.soloGames : [],
+    flexGames: Array.isArray(result?.flexGames) ? result.flexGames : [],
   };
 }
 
 async function fetchRecentStat(openId, areaId) {
-  const { lzyumiSign, signStr } = createSignature();
-  const p = new URLSearchParams({ openId, areaId: String(areaId), lzyumiSign, signStr });
-  return lzyumiGet(`${LZYUMI_BASE_URL}/getPlayerRecentStat?${p}`);
+  return proxyGet("recent", { openId, areaId });
 }
 
 // Strip Unicode bidirectional control characters that can be embedded in user-supplied
@@ -450,14 +393,17 @@ function startHttpServer(pool) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 if (!DATABASE_URL) {
-  console.error(
-    "[refresh] ✗ DATABASE_URL is not set.\n" +
-      "          Add it to the Railway environment variables and redeploy.",
-  );
+  console.error("[refresh] ✗ DATABASE_URL is not set. Add it to Railway env vars.");
+  process.exit(1);
+}
+
+if (!ECL_JOB_SECRET) {
+  console.error("[refresh] ✗ ECL_JOB_SECRET is not set. Add it to Railway env vars (must match Vercel).");
   process.exit(1);
 }
 
 console.log("[refresh] ECL Refresh Worker starting...");
+console.log(`[refresh]   Proxy          : ${ECL_SITE_URL}/api/lzyumi-proxy`);
 console.log(`[refresh]   Poll interval  : every ${POLL_INTERVAL_MS / 60000} minutes`);
 console.log(`[refresh]   Batch size     : ${BATCH_SIZE} profiles`);
 console.log(`[refresh]   Stale window   : ${REFRESH_STALE_MS / 3600000} hours`);
