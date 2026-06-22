@@ -104,7 +104,7 @@ function lookupUrl(riotName, areaId, filter = 1) {
   const { lzyumiSign, signStr } = createSignature();
   const p = new URLSearchParams({
     nickname: riotName.trim(),
-    allCount: "10",
+    allCount: filter === 1 ? "10" : "20",
     areaId: String(server.id),
     areaName: server.name,
     seleMe: "1",
@@ -137,8 +137,38 @@ async function fetchRecentStat(openId, areaId) {
   return lzyumiGet(`${LZYUMI_BASE_URL}/getPlayerRecentStat?${p}`);
 }
 
-function normalizeRiotId(name, tag) {
-  return `${name.trim()}#${tag.trim()}`.toLowerCase();
+async function lookupProfileWithFallback(riotName, riotTag, areaId) {
+  // Mirror the website's lookupLzyumiIdentity: try plain name first, then name#tag.
+  // lzyumi often resolves on the plain name but not the full Riot ID.
+  const candidates = Array.from(
+    new Set([riotName.trim(), riotTag ? `${riotName.trim()}#${riotTag.trim()}` : null].filter(Boolean))
+  );
+
+  let fallback = null;
+  for (const candidate of candidates) {
+    const raw = await lookupProfile(candidate, areaId);
+    const resolvedName = raw?.battleInfo?.nameInfoNew;
+    const openId = raw?.battleInfo?.openId;
+
+    if (!raw?.battleInfo || !openId || !resolvedName) {
+      fallback = fallback ?? { found: false, raw };
+      continue;
+    }
+
+    // If we have a tag, verify it matches
+    if (riotTag) {
+      const resolved = resolvedName.trim().toLowerCase();
+      const expected = normalizeRiotId(riotName, riotTag);
+      if (resolved !== expected) {
+        fallback = fallback ?? { found: false, raw, mismatch: `expected "${expected}", got "${resolved}"` };
+        continue;
+      }
+    }
+
+    return { found: true, raw };
+  }
+
+  return fallback ?? { found: false, raw: null };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,52 +179,38 @@ async function refreshProfile(pool, profile) {
   const { id, displayName, riotName, riotTag, openId: storedOpenId, chinaServerId } = profile;
   const lookupName = riotTag ? `${riotName}#${riotTag}` : riotName;
 
-  // Fire the two most important calls in parallel
-  const [rawResult, rankedResult] = await Promise.allSettled([
-    lookupProfile(lookupName, chinaServerId),
+  // Mirror website's lookupLzyumiIdentity: try plain name first, then name#tag
+  const [lookupResult, rankedResult] = await Promise.allSettled([
+    lookupProfileWithFallback(riotName, riotTag, chinaServerId),
     fetchRankedGames(lookupName, chinaServerId),
   ]);
 
   // Both hard-failed – bump timestamp only so we don't retry in the next poll
-  if (rawResult.status === "rejected" && rankedResult.status === "rejected") {
+  if (lookupResult.status === "rejected" && rankedResult.status === "rejected") {
     await pool.query(
       `UPDATE "AccountProfile" SET "lzyumiLastLookupAt" = NOW() WHERE id = $1`,
       [id],
     );
-    return { ok: false, reason: "all_lzyumi_calls_failed", detail: rawResult.reason?.message };
+    return { ok: false, reason: "all_lzyumi_calls_failed", detail: lookupResult.reason?.message };
   }
 
   // ── Resolve openId + validate identity ────────────────────────────────────
   let openId = storedOpenId || null;
   let validRawProfile = null;
 
-  if (rawResult.status === "fulfilled") {
-    const raw = rawResult.value;
-    const freshOpenId = raw?.battleInfo?.openId;
-    if (freshOpenId) openId = freshOpenId;
-
-    // Debug: log what lzyumi actually returned
-    if (!raw?.battleInfo) {
-      console.warn(`[refresh] ⚠ ${displayName}: lzyumi returned no battleInfo. code=${raw?.code} message=${raw?.message}`);
-    }
-
-    if (riotTag && raw?.battleInfo?.nameInfoNew) {
-      // Verify lzyumi returned the correct account
-      const resolved = raw.battleInfo.nameInfoNew.trim().toLowerCase();
-      const expected = normalizeRiotId(riotName, riotTag);
-      if (resolved === expected) {
-        validRawProfile = raw;
-      } else {
-        console.warn(`[refresh] ⚠ Mismatch for ${displayName}: expected "${expected}", got "${resolved}"`);
-      }
-    } else if (raw?.battleInfo?.openId) {
-      // No tag to verify against – accept as-is
+  if (lookupResult.status === "fulfilled") {
+    const { found, raw, mismatch } = lookupResult.value;
+    if (found && raw) {
       validRawProfile = raw;
-    } else if (raw?.battleInfo && !raw.battleInfo?.nameInfoNew) {
-      console.warn(`[refresh] ⚠ ${displayName}: battleInfo exists but nameInfoNew is missing. openId=${raw.battleInfo?.openId}`);
+      const freshOpenId = raw?.battleInfo?.openId;
+      if (freshOpenId) openId = freshOpenId;
+    } else if (mismatch) {
+      console.warn(`[refresh] ⚠ ${displayName}: identity mismatch – ${mismatch}`);
+    } else {
+      console.warn(`[refresh] ⚠ ${displayName}: not found on lzyumi (code=${raw?.code})`);
     }
   } else {
-    console.warn(`[refresh] ⚠ ${displayName}: raw lookup rejected – ${rawResult.reason?.message}`);
+    console.warn(`[refresh] ⚠ ${displayName}: lookup threw – ${lookupResult.reason?.message}`);
   }
 
   if (rankedResult.status === "fulfilled") {
